@@ -103,6 +103,8 @@ Step 4 must end with exactly `generated: customers=1200 products=40 orders_raw=1
 
 `order_amount` is read as `object` because it contains text values. pandas reads the 53 `N/A` entries as missing; the other unparseable entries are the text `error`, which is why the non-numeric count below (120) is larger than the missing count (53).
 
+With pandas 3 (the version in requirements.txt) these text columns print as `str` instead of `object`; the counts are identical.
+
 `tickets.csv` (read with `keep_default_na=False`, used in Part C) — shape (164, 5), all columns `object`, 0 missing values. Empty ticket texts stay empty strings rather than becoming NaN.
 
 **Audit figures**
