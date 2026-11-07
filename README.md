@@ -25,6 +25,7 @@ validate.py             Part A: asserts the reference checkpoints
 partA_analysis.py       Part A: runs the 7 SQL queries, pandas cross-check, EDA
 partB_segments.py       Part B: RFM, K-means segments, PCA
 partB_lapse.py          Part B: lapse model, class balance, retention list
+partC_triage.py         Part C: guardrails, redaction, retries, validation, budget, routing
 sql/queries.sql         Part A: the 7 SQL queries (Q1-Q7)
 data/raw/               generated raw data and policy evaluation files
 data/policies/          five policy text documents
@@ -47,10 +48,11 @@ Run from the repository root in a clean clone (Python 3.11 or newer).
 7. `python partA_analysis.py`
 8. `python partB_segments.py`
 9. `python partB_lapse.py`
+10. `python partC_triage.py`
 
 Step 4 must end with exactly `generated: customers=1200 products=40 orders_raw=13084 tickets=164`, and step 6 must print `ALL CHECKPOINTS PASSED`.
 
-*(Commands for Parts C and D will be added as those Parts are completed.)*
+*(Commands for Part D will be added when that Part is completed.)*
 
 ## Part A
 
@@ -368,7 +370,97 @@ Lapsed training rows were randomly duplicated (with replacement, `random_state=4
 
 ## Part C
 
-*To be completed.*
+Script: `partC_triage.py`. Tickets are read with `keep_default_na=False` and processed in file order. Every model call goes through the offline `mock_llm.chat`.
+
+### C1. Input guardrails (before any model call)
+
+| Rule | Status | Tickets |
+|---|---|---|
+| Text empty or only whitespace | `skipped_empty` | 4 |
+| `est_tokens(text)` > `MAX_INPUT_TOKENS = 400` | `flagged_long` | 4 (each estimates to 734 tokens) |
+
+These 8 tickets are never sent to the model.
+
+### C2. Personal-information redaction
+
+The three patterns are applied in this order, to all 164 tickets:
+
+| Type | Pattern | Placeholder | Substitutions |
+|---|---|---|---|
+| Email | `[\w.+-]+@[\w-]+\.[\w.]+` | `[EMAIL]` | 55 |
+| Phone | `\b[6-9]\d{9}\b` | `[PHONE]` | 91 |
+| Order id | `ORD-\d{6}` | `[ORDER_ID]` | 132 |
+| **Total** | | | **278** |
+
+Re-applying the three patterns to the redacted texts finds **0** matches (asserted in code), and an assertion before every model call checks that the prompt contains no email, phone number or order id. The user message is exactly the redacted ticket text and nothing else.
+
+### C3. Prompts
+
+- **Zero-shot** (about 43 estimated tokens): contains `CLASSIFY`, lists billing, delivery, technical and fraud, and requires a JSON-only reply `{"category": "...", "reason": "..."}`. It does not contain `EXAMPLES:`.
+- **Few-shot** (about 117 estimated tokens): the same instructions plus an `EXAMPLES:` line and four labelled examples, one per category, including a fraud example.
+
+### C4. Resilient calls
+
+Every model call is wrapped in a retry function: at most 3 retries per ticket, waiting `BASE_DELAY × 2**n × random.uniform(0.9, 1.15)` seconds before retry n, with `BASE_DELAY = 0.05`. Each retry prints one log line with the ticket id, retry number and wait, for example `retry ticket=T0002 retry_number=0 wait=0.0530s (503 server busy)`. `mock_llm.reset()` is called immediately before each full run.
+
+**Result:** each full run over the 156 eligible tickets raised exactly **19** `TransientLLMError`s, and **all 19 were recovered** on the first retry (every wait between 0.045 and 0.0575 seconds, asserted in code). No ticket ended with a permanent error.
+
+### C5. Output validation
+
+1. Parse the reply as JSON; accept it if `category` is one of the four allowed values → `classified_json`.
+2. If it is not valid JSON, extract words with `re.findall(r"[a-z]+", text.lower())`; accept it if exactly one allowed category word is present → `classified_keyword`.
+3. Otherwise, including valid JSON with a category outside the list (the mock's `"shipping"`), → `flagged_invalid_output`, routed to human review. The pipeline never guesses.
+
+| Status (one full run, 156 eligible tickets) | Count |
+|---|---|
+| `classified_json` | 135 |
+| `classified_keyword` | 12 |
+| `flagged_invalid_output` | 9 |
+
+### C6. Zero-shot vs few-shot (no token budget)
+
+| Prompt | Classified | Correct | Accuracy | Total tokens | Tokens per classified ticket |
+|---|---|---|---|---|---|
+| Zero-shot | 147 | 126 | **85.7%** | 11,116 | 75.6 |
+| Few-shot | 147 | 147 | **100.0%** | 22,660 | 154.1 |
+
+**Zero-shot confusion table** (rows = true category, columns = predicted)
+
+| True \ Predicted | billing | delivery | fraud | technical |
+|---|---|---|---|---|
+| billing | 38 | 0 | 0 | 0 |
+| delivery | 0 | 36 | 0 | 0 |
+| fraud | **11** | 0 | 23 | 0 |
+| technical | **10** | 0 | 0 | 29 |
+
+Every zero-shot error is a fraud ticket (11) or a technical ticket (10) predicted as billing.
+
+**When the few-shot cost is worth paying:** the few-shot prompt roughly doubles the cost, from 75.6 to 154.1 tokens per classified ticket (11,544 extra tokens for the run), and raises accuracy from 85.7% to 100%, fixing all 21 errors. Those errors are not harmless: with zero-shot, 11 fraud tickets would land in the normal billing queue instead of going to the security team at HIGH priority. Because a missed fraud case costs far more than about 79 extra tokens per ticket, the few-shot prompt is worth paying for here; zero-shot would only be acceptable for low-risk, high-volume traffic where a wrong queue is cheap to fix.
+
+### C7. Token budget and routing
+
+**(a) Budget demo** (`outputs/triage_budget_demo.csv`): the zero-shot pipeline with `TOKEN_BUDGET = 6000`. Before each call, if the running total of `usage.total_tokens` is already at or above the budget, no call is made and the ticket gets `budget_exhausted` (human review). The run stopped calling the model at 6,010 tokens, and **72 tickets ended `budget_exhausted`**.
+
+| Status | Count |
+|---|---|
+| classified_json | 74 |
+| classified_keyword | 6 |
+| flagged_invalid_output | 4 |
+| budget_exhausted | 72 |
+| skipped_empty / flagged_long | 4 / 4 |
+
+**(b) Final results** (`outputs/triage_results.csv`, 164 rows): a few-shot run with `TOKEN_BUDGET = 100000` (not reached; 22,660 tokens used), routed with the segments from Part B:
+
+| Rule (applied in order) | Route | Priority | Tickets |
+|---|---|---|---|
+| Status `skipped_empty`, `flagged_long`, `flagged_invalid_output` or `budget_exhausted` | `human_review` | NORMAL | 17 |
+| Category `fraud` | `security_team` | HIGH | 34 |
+| Customer `is_premium` is true | `premium_desk` | HIGH | 11 |
+| Everything else | `support_queue` | NORMAL | 102 |
+
+A customer with no row in `outputs/customer_segments.csv` is treated as not premium. Columns: ticket_id, customer_id, status, category, segment_name, priority, route, tokens_used; category and segment_name are blank when not available.
+
+**Rule-validated vs human:** the 147 tickets with status `classified_json` or `classified_keyword` were classified by the model and accepted only after passing the validation rules in C5; these were routed automatically. The other 17 tickets (4 empty, 4 too long, 9 invalid model outputs) were never auto-classified and went to human review.
 
 ## Part D
 
@@ -380,4 +472,5 @@ Lapsed training rows were randomly duplicated (with replacement, `random_state=4
 - Missing ages and delivery times are filled with group medians, which reduces natural variation in those columns.
 - The Premium flag is a post-hoc whole-window label computed from orders that include the September lapse window, so the retention list is illustrative and not a leakage-free evaluation. A production version should compute segments from pre-cutoff orders only.
 - The lapse model is tested on a single 232-customer split; repeated cross-validation or a later time window would give a more reliable estimate.
-- *(Further limitations for Parts C and D will be added as those Parts are completed.)*
+- Part C's triage uses a keyword-based mock model; accuracy against a real hosted model would differ, and the redaction patterns cover only emails, Indian mobile numbers and order ids (names or addresses would pass through).
+- *(Further limitations for Part D will be added when that Part is completed.)*
