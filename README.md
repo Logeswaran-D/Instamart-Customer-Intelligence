@@ -13,7 +13,7 @@ An internal Customer Intelligence & Support Copilot for a quick-commerce grocery
 
 All data is synthetic and fictional, produced by `generate_data.py`. Every language-model call goes through the supplied offline `mock_llm.py`, so no API key, account, network connection or paid service is used. All monetary values are in Indian Rupees (INR).
 
-**Tech stack:** Python 3.12+, pandas, numpy, scikit-learn, joblib, sqlite3 (standard library).
+**Tech stack:** Python 3.11+, pandas, numpy, scikit-learn, joblib, sqlite3 (standard library).
 
 ### Repository layout
 
@@ -39,7 +39,7 @@ state/                  Part D agent checkpoints
 
 ## Reproduce
 
-Run from the repository root in a clean clone. Tested with Python 3.13 on Windows; use Python 3.12 or 3.13.
+Run from the repository root in a clean clone. Tested with Python 3.11 and 3.13 on Windows (Python 3.11 or newer).
 
 1. `python -m venv venv`
 2. `source venv/bin/activate`  (Windows: `venv\Scripts\activate`)
